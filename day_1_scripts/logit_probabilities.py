@@ -7,37 +7,75 @@ from llama_cpp import Llama
 import plotly.graph_objects as go
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 os.environ.setdefault("GGML_METAL_LOG_LEVEL", "1")
 
 DEFAULT_MODEL_PATH = "/Users/jdavies/.lmstudio/models/unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q8_0.gguf"
 DEFAULT_GPU_LAYERS = -1
-DEFAULT_PROMPT = "The capital of France is"
+DEFAULT_CONTEXT_SIZE = 8192
+DEFAULT_SYSTEM_PROMPT = "You are a Yoda assistant, you always reply like Yoda and often mention the force. You are wise with your words."
+DEFAULT_USER_PROMPT = "Where is Westminster Abbey?"
+DEFAULT_GENERATE_PROMPT = "The cat shat on the"
+
+# Fixed display size: top 5 candidate tokens + an "other" wedge for the remainder.
+NUM_TOKENS_DISPLAYED = 5
+
+# Qwen3-series recommended sampling for *non-thinking* mode (the mode this app forces).
+# Source: Qwen team guidance for Qwen3 chat models; presence/repetition penalties off by default.
+QWEN3_NO_THINK_DEFAULTS = dict(
+    temperature=0.7,
+    top_p=0.8,
+    top_k=20,
+    repeat_penalty=1.0,
+    num_tokens=NUM_TOKENS_DISPLAYED,
+)
 
 
 @dataclass
 class InferenceConfig:
-    temperature: float = 0.8
-    top_p: float = 0.95
-    top_k: int = 40
-    repeat_penalty: float = 1.1
-    num_tokens: int = 10
+    temperature: float = QWEN3_NO_THINK_DEFAULTS["temperature"]
+    top_p: float = QWEN3_NO_THINK_DEFAULTS["top_p"]
+    top_k: int = QWEN3_NO_THINK_DEFAULTS["top_k"]
+    repeat_penalty: float = QWEN3_NO_THINK_DEFAULTS["repeat_penalty"]
+    num_tokens: int = QWEN3_NO_THINK_DEFAULTS["num_tokens"]
 
 
 class SuppressStderr:
     def __enter__(self):
         self._original_stderr = sys.stderr
-        sys.stderr = open(os.devnull, 'w')
+        self._devnull = open(os.devnull, "w")
+        sys.stderr = self._devnull
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        sys.stderr.close()
         sys.stderr = self._original_stderr
+        self._devnull.close()
+
+
+def build_chat_prompt(system_prompt: str, user_prompt: str, assistant_prefix: str = "") -> str:
+    """Qwen3 ChatML prompt with thinking mode forcibly disabled.
+
+    Two complementary mechanisms (both required for reliable no-think behavior):
+      1. `/no_think` directive appended to the system prompt.
+      2. Pre-seeded empty <think>\\n\\n</think>\\n\\n block at the start of the assistant turn,
+         so the very first token the model emits is the actual answer.
+    """
+    system_text = system_prompt.strip() if system_prompt.strip() else "You are a helpful assistant."
+    return (
+        f"<|im_start|>system\n{system_text} /no_think<|im_end|>\n"
+        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+        f"<|im_start|>assistant\n<think>\n\n</think>\n\n{assistant_prefix}"
+    )
 
 
 class TokenProbabilityAnalyzer:
-    def __init__(self, model_path: str, n_ctx: int = 2048, n_gpu_layers: int = 0):
+    # Special tokens we treat as "stop signals". We probe the model's vocab for
+    # any that resolve to a single token id and report their probability at
+    # every step — even when they fall outside the top-5 display set.
+    STOP_TOKEN_LITERALS = ("<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end|>", "</s>")
+
+    def __init__(self, model_path: str, n_ctx: int = DEFAULT_CONTEXT_SIZE, n_gpu_layers: int = 0):
         with SuppressStderr():
             self.model = Llama(
                 model_path=model_path,
@@ -45,147 +83,107 @@ class TokenProbabilityAnalyzer:
                 n_ctx=n_ctx,
                 n_gpu_layers=n_gpu_layers,
                 verbose=False,
-                chat_format="chatml"
+                chat_format="chatml",
             )
         self.debug_info = ""
+        self.last_prompt = ""
+        self.stop_token_ids = self._resolve_stop_token_ids()
+        self.last_stop_probs: List[Tuple[str, int, float]] = []  # [(literal, token_id, prob)]
 
-    def analyze_next_tokens(self, system_prompt: str, user_prompt: str, config: InferenceConfig) -> List[Tuple[str, float, float]]:
-        # Qwen3 thinking suppression: `/no_think` in system + pre-seeded empty <think></think> block
-        formatted_prompt = "<|im_start|>system\n"
-        if system_prompt.strip():
-            formatted_prompt += system_prompt.strip()
-        else:
-            formatted_prompt += "You are a helpful assistant."
-        formatted_prompt += " /no_think<|im_end|>\n"
-        formatted_prompt += f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-        formatted_prompt += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    def _resolve_stop_token_ids(self) -> List[Tuple[str, int]]:
+        resolved: List[Tuple[str, int]] = []
+        for literal in self.STOP_TOKEN_LITERALS:
+            try:
+                ids = self.model.tokenize(literal.encode("utf-8"), add_bos=False, special=True)
+            except Exception:
+                continue
+            if len(ids) == 1:
+                resolved.append((literal, ids[0]))
+        return resolved
 
-        self.debug_info = f"Chat mode - formatted prompt length: {len(formatted_prompt)} chars\n"
+    def analyze_prompt(self, prompt: str, config: InferenceConfig) -> List[Tuple[str, float, float]]:
+        """Return (token_str, probability, raw_logit) for the most likely next tokens.
 
-        output = self.model.create_completion(
-            prompt=formatted_prompt, max_tokens=1, logprobs=20,
-            temperature=1.0, top_p=1.0, top_k=-1,
-            repeat_penalty=config.repeat_penalty, echo=False
-        )
+        Uses the low-level eval/scores API. This is *far* more reliable than
+        create_completion(logprobs=N), which intermittently returns empty
+        top_logprobs on finish_reason='length' — the bug the old retry hack tried to paper over.
+        """
+        self.last_prompt = prompt
+        token_ids = self.model.tokenize(prompt.encode("utf-8"), add_bos=True, special=True)
+        self.debug_info = f"Prompt: {len(prompt)} chars → {len(token_ids)} tokens\n"
 
-        result = self._extract_probabilities(output, config)
-
-        # Workaround for intermittent llama-cpp bug: top_logprobs returns empty on finish_reason="length".
-        # Retrying with a perturbed prompt (trailing space) and slightly different repeat_penalty usually succeeds.
-        if not result and "choices" in output and output["choices"]:
-            choice = output["choices"][0]
-            if choice.get("finish_reason") == "length":
-                self.debug_info += "\nAutomatically retrying due to empty logprobs bug...\n"
-                output2 = self.model.create_completion(
-                    prompt=formatted_prompt + " ", max_tokens=1, logprobs=20,
-                    temperature=1.0, top_p=1.0, top_k=-1,
-                    repeat_penalty=config.repeat_penalty * 0.99, echo=False
-                )
-                result = self._extract_probabilities(output2, config)
-                if result:
-                    self.debug_info += f"SUCCESS: Retry worked! Got {len(result)} tokens\n"
-                else:
-                    self.debug_info += "Retry also returned empty logprobs\n"
-
-        return result
-
-    def analyze_continuation(self, prompt: str, config: InferenceConfig) -> List[Tuple[str, float, float]]:
-        self.debug_info = f"Analyzing continuation of: {repr(prompt[-50:])}\n"
-        self.debug_info += f"Full prompt length: {len(prompt)} chars\n"
-
-        output = self.model.create_completion(
-            prompt=prompt, max_tokens=1, logprobs=20,
-            temperature=1.0, top_p=1.0, top_k=-1,
-            repeat_penalty=config.repeat_penalty, echo=False
-        )
-
-        if "choices" in output and output["choices"]:
-            choice = output["choices"][0]
-            self.debug_info += f"\nGenerated text: {repr(choice.get('text', ''))}\n"
-            self.debug_info += f"Finish reason: {choice.get('finish_reason', 'None')}\n"
-            logprobs = choice.get("logprobs", {})
-            if isinstance(logprobs, dict):
-                top_logprobs = logprobs.get("top_logprobs", [])
-                self.debug_info += f"Top_logprobs length: {len(top_logprobs)}\n"
-                if not top_logprobs:
-                    self.debug_info += "WARNING: top_logprobs is empty! (common llama-cpp bug)\n"
-
-        result = self._extract_probabilities(output, config)
-
-        # Same empty-logprobs retry as Chat mode
-        if not result and choice.get("finish_reason") == "length":
-            self.debug_info += "\nAutomatically retrying due to empty logprobs bug...\n"
-            output2 = self.model.create_completion(
-                prompt=prompt + " ", max_tokens=1, logprobs=20,
-                temperature=1.0, top_p=1.0, top_k=-1,
-                repeat_penalty=config.repeat_penalty * 0.99, echo=False
-            )
-            if "choices" in output2 and output2["choices"]:
-                choice2 = output2["choices"][0]
-                logprobs2 = choice2.get("logprobs", {})
-                if isinstance(logprobs2, dict) and logprobs2.get("top_logprobs"):
-                    self.debug_info += f"SUCCESS: Retry worked!\n"
-                    result = self._extract_probabilities(output2, config)
-                else:
-                    self.debug_info += "Retry also returned empty logprobs\n"
-
-        return result
-
-    def _extract_probabilities(self, output: dict, config: InferenceConfig) -> List[Tuple[str, float, float]]:
-        if "choices" not in output or not output["choices"]:
-            self.debug_info += "ERROR: No choices in output\n"
+        n_ctx = self.model.n_ctx()
+        if len(token_ids) >= n_ctx:
+            self.debug_info += f"ERROR: prompt ({len(token_ids)} tokens) exceeds context window ({n_ctx})\n"
             return []
 
-        choice = output["choices"][0]
-        if choice.get("finish_reason") == "stop":
-            self.debug_info += "Model returned stop token - end of generation\n"
+        self.model.reset()
+        self.model.eval(token_ids)
+
+        # scores[i] are the logits predicting position i+1; the next-token logits
+        # therefore live at scores[n_tokens - 1].
+        last_idx = self.model.n_tokens - 1
+        logits = np.array(self.model.scores[last_idx], dtype=np.float64, copy=True)
+
+        self._apply_repeat_penalty(logits, token_ids, config.repeat_penalty)
+        return self._top_tokens_from_logits(logits, config)
+
+    @staticmethod
+    def _apply_repeat_penalty(logits: np.ndarray, token_ids: List[int], penalty: float) -> None:
+        if penalty == 1.0 or not token_ids:
+            return
+        for tid in set(token_ids):
+            if 0 <= tid < logits.shape[0]:
+                logits[tid] = logits[tid] / penalty if logits[tid] > 0 else logits[tid] * penalty
+
+    def _top_tokens_from_logits(self, logits: np.ndarray, config: InferenceConfig) -> List[Tuple[str, float, float]]:
+        # Temperature-scaled softmax, numerically stable.
+        temp = max(config.temperature, 1e-6)
+        scaled = (logits - logits.max()) / temp
+        exp = np.exp(scaled)
+        probs = exp / exp.sum()
+
+        # Capture stop-token probabilities BEFORE filtering, so the UI can show
+        # them even when EOS is ranked far below the top 5 (typical mid-paragraph
+        # in Generate mode — exactly the "why doesn't it stop?" moment).
+        self.last_stop_probs = [
+            (literal, tid, float(probs[tid]))
+            for literal, tid in self.stop_token_ids
+            if 0 <= tid < probs.shape[0]
+        ]
+
+        # Always surface the top `num_tokens` candidates by *raw* probability.
+        # We deliberately do NOT use top_p/top_k as display filters: with an
+        # aggressive top_p (e.g. 0.8 when the model is confident) the survivor
+        # set collapses to a single token, hiding the long tail this tool exists
+        # to show. top_p/top_k remain in the UI as sampler-reference values.
+        n = min(config.num_tokens, len(probs))
+        if n <= 0:
             return []
+        top_idx = np.argpartition(-probs, n - 1)[:n]
+        top_idx = top_idx[np.argsort(-probs[top_idx])]
 
-        logprobs_data = choice.get("logprobs", {})
-        if not logprobs_data:
-            self.debug_info += "ERROR: No logprobs data returned\n"
-            return []
+        results: List[Tuple[str, float, float]] = []
+        for idx in top_idx:
+            idx_int = int(idx)
+            try:
+                token_str = self.model.detokenize([idx_int]).decode("utf-8", errors="replace")
+            except Exception:
+                token_str = f"<id:{idx_int}>"
+            # Absolute probability over the full vocab — no renormalization.
+            results.append((token_str, float(probs[idx]), float(logits[idx])))
+        return results
 
-        top_logprobs = logprobs_data.get("top_logprobs", [])
-        if not top_logprobs:
-            self.debug_info += "ERROR: Empty top_logprobs list\n"
-            return []
-
-        first_position = top_logprobs[0]
-        if not first_position:
-            return []
-
-        token_logprobs = list(first_position.items())
-        original_logprobs = {token: logprob for token, logprob in token_logprobs}
-
-        if config.temperature != 1.0:
-            token_logprobs = [(token, logprob / config.temperature) for token, logprob in token_logprobs]
-
-        token_probs = [(token, float(np.exp(logprob)), original_logprobs[token]) for token, logprob in token_logprobs]
-        token_probs.sort(key=lambda x: x[1], reverse=True)
-
-        if config.top_k > 0:
-            token_probs = token_probs[:config.top_k]
-
-        if config.top_p < 1.0:
-            token_probs = self._apply_top_p_filtering(token_probs, config.top_p)
-
-        total_prob = sum(prob for _, prob, _ in token_probs)
-        if total_prob > 0:
-            token_probs = [(token, prob / total_prob, logprob) for token, prob, logprob in token_probs]
-
-        return token_probs[:config.num_tokens]
-
-    def _apply_top_p_filtering(self, token_probs: List[Tuple[str, float, float]], top_p: float) -> List[Tuple[str, float, float]]:
-        token_probs.sort(key=lambda x: x[1], reverse=True)
-        cumulative_prob = 0.0
-        filtered_tokens = []
-        for token, prob, logprob in token_probs:
-            cumulative_prob += prob
-            filtered_tokens.append((token, prob, logprob))
-            if cumulative_prob >= top_p:
-                break
-        return filtered_tokens
+    def stop_rank_for(self, token_id: int) -> Optional[int]:
+        """Return the 1-based rank of a token id in the most recent distribution,
+        if we still have the logits accessible. Used only for the readout."""
+        try:
+            last_idx = self.model.n_tokens - 1
+            logits = np.array(self.model.scores[last_idx], dtype=np.float64, copy=False)
+            # 1-based rank: how many tokens have a higher logit
+            return int((logits > logits[token_id]).sum()) + 1
+        except Exception:
+            return None
 
 
 current_analyzer: Optional[TokenProbabilityAnalyzer] = None
@@ -194,206 +192,221 @@ last_analysis_results: Optional[List[Tuple[str, float, float]]] = None
 
 def load_model(model_path: str, context_size: int, gpu_layers: int) -> str:
     global current_analyzer, last_analysis_results
-
     if not model_path.strip():
         return "Error: Model path cannot be empty"
-
     try:
         current_analyzer = TokenProbabilityAnalyzer(
-            model_path=model_path, n_ctx=context_size, n_gpu_layers=gpu_layers
+            model_path=model_path, n_ctx=int(context_size), n_gpu_layers=int(gpu_layers)
         )
         last_analysis_results = None
         return f"✅ Model loaded: {Path(model_path).name}"
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        return f"❌ Error: {e}"
+
+
+STOP_TOKENS = {"</s>", "<|endoftext|>", "<|im_end|>", "<|end|>", "<|eot_id|>", "<eos>"}
+WHITESPACE_CONTROLS = {"\n", "\t", "\r"}
 
 
 def is_stop_token(token: str) -> bool:
-    stop_tokens = {'</s>', '<|endoftext|>', '<|im_end|>', '<|end|>', '<|eot_id|>', '<eos>'}
-    if token in stop_tokens:
+    if token in STOP_TOKENS:
         return True
-    if len(token) == 1 and ord(token) < 32:
+    if not token:
+        return True
+    # Single-char unprintable control (excluding ordinary whitespace) counts as a stop;
+    # newlines and tabs are normal generation tokens and must not disable the flow.
+    if len(token) == 1 and ord(token) < 32 and token not in WHITESPACE_CONTROLS:
         return True
     return False
 
 
-def analyze_tokens(mode: str, system_prompt: str, user_prompt: str, generate_prompt: str,
-                   temperature: float, top_p: float, top_k: int, repeat_penalty: float, num_tokens: int) -> tuple:
+def _disabled_buttons():
+    """Default 5-button state shown before any analysis exists."""
+    return [gr.Button(value=f"#{i + 1}", interactive=False) for i in range(NUM_TOKENS_DISPLAYED)]
+
+
+def _button_updates_for(token_probs):
+    """Label each candidate button with its rank + token preview, and disable
+    buttons whose token is a stop token (clicking them would terminate)."""
+    updates = []
+    for i in range(NUM_TOKENS_DISPLAYED):
+        if i < len(token_probs):
+            token, _prob, _logit = token_probs[i]
+            preview = repr(token)
+            if len(preview) > 14:
+                preview = preview[:11] + "…"
+            label = f"#{i + 1} {preview}"
+            updates.append(gr.Button(value=label, interactive=not is_stop_token(token)))
+        else:
+            updates.append(gr.Button(value=f"#{i + 1}", interactive=False))
+    return updates
+
+
+def _analyze_response(token_probs, formatted_prompt_text):
+    if not token_probs:
+        msg = (
+            "**No tokens returned.**\n\n"
+            f"```\n{current_analyzer.debug_info if current_analyzer else ''}```"
+        )
+        return (msg, None, *_disabled_buttons(), formatted_prompt_text)
+    stop_probs = list(current_analyzer.last_stop_probs) if current_analyzer else []
+    body = format_top_tokens(token_probs, stop_probs)
+    chart = create_pie_chart(token_probs)
+    return (body, chart, *_button_updates_for(token_probs), formatted_prompt_text)
+
+
+def analyze_tokens(mode, system_prompt, user_prompt, generate_prompt,
+                   temperature, top_p, top_k, repeat_penalty):
     global current_analyzer, last_analysis_results
 
     if current_analyzer is None:
-        return "Error: No model loaded", None, gr.Button(interactive=False)
+        return ("⚠️ No model loaded — open the **Model Configuration** tab to load one.",
+                None, *_disabled_buttons(), "")
 
     active_prompt = user_prompt if mode == "Chat" else generate_prompt
     if not active_prompt or not active_prompt.strip():
-        return "Error: prompt is empty — type something before clicking Analyze", None, gr.Button(interactive=False)
+        return ("⚠️ Prompt is empty — type something before clicking Analyze.",
+                None, *_disabled_buttons(), "")
 
-    config = InferenceConfig(temperature, top_p, top_k, repeat_penalty, num_tokens)
+    config = InferenceConfig(
+        temperature=float(temperature),
+        top_p=float(top_p),
+        top_k=int(top_k),
+        repeat_penalty=float(repeat_penalty),
+        num_tokens=NUM_TOKENS_DISPLAYED,
+    )
 
     try:
-        current_analyzer.debug_info = ""
-
-        if mode == "Chat":
-            token_probs = current_analyzer.analyze_next_tokens(system_prompt, user_prompt, config)
-        else:
-            token_probs = current_analyzer.analyze_continuation(generate_prompt, config)
-
+        prompt = build_chat_prompt(system_prompt, user_prompt) if mode == "Chat" else generate_prompt
+        token_probs = current_analyzer.analyze_prompt(prompt, config)
         last_analysis_results = token_probs
-
-        if not token_probs:
-            debug_msg = "**No tokens found**\n\n"
-            debug_msg += "**Debug Information:**\n```\n"
-            debug_msg += current_analyzer.debug_info
-            debug_msg += "```\n\n"
-            debug_msg += "**Try clicking Analyze again** - this issue is intermittent and often works on retry."
-            return debug_msg, None, gr.Button(interactive=False)
-
-        formatted_results = format_results(token_probs)
-
-        if current_analyzer.debug_info and "SUCCESS: Retry worked!" in current_analyzer.debug_info:
-            formatted_results += "\n\n✅ _Auto-retry: Successfully recovered from empty logprobs bug_"
-
-        pie_chart = create_pie_chart(token_probs)
-
-        if token_probs and is_stop_token(token_probs[0][0]):
-            button_state = gr.Button(interactive=False)
-            formatted_results += "\n\n🔒 'Add Top Token' disabled - top token is a stop token"
-        else:
-            button_state = gr.Button(interactive=True)
-
-        return formatted_results, pie_chart, button_state
-
+        return _analyze_response(token_probs, current_analyzer.last_prompt)
     except Exception as e:
         import traceback
-        error_msg = f"Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-        return error_msg, None, gr.Button(interactive=False)
+        return (f"Error: {e}\n\n```\n{traceback.format_exc()}```",
+                None, *_disabled_buttons(), "")
 
 
-def add_top_token(mode: str, system_prompt: str, user_prompt: str, generate_prompt: str,
-                  chat_response: str, temperature: float, top_p: float, top_k: int,
-                  repeat_penalty: float, num_tokens: int) -> tuple:
+def add_token_by_rank(rank, mode, system_prompt, user_prompt, generate_prompt, chat_response,
+                      temperature, top_p, top_k, repeat_penalty):
+    """Inject the candidate at 1-based `rank` (1..NUM_TOKENS_DISPLAYED) and re-analyze."""
     global current_analyzer, last_analysis_results
 
-    if not last_analysis_results:
-        return "No previous analysis to use", None, gr.Button(interactive=False), generate_prompt, chat_response
+    if not last_analysis_results or rank < 1 or rank > len(last_analysis_results):
+        return ("Run **Analyze** first.", None, *_disabled_buttons(),
+                generate_prompt, chat_response, "")
 
-    top_token = last_analysis_results[0][0]
-    config = InferenceConfig(temperature, top_p, top_k, repeat_penalty, num_tokens)
+    chosen_token = last_analysis_results[rank - 1][0]
+    config = InferenceConfig(
+        temperature=float(temperature),
+        top_p=float(top_p),
+        top_k=int(top_k),
+        repeat_penalty=float(repeat_penalty),
+        num_tokens=NUM_TOKENS_DISPLAYED,
+    )
 
     try:
-        current_analyzer.debug_info = ""
-
         if mode == "Chat":
-            new_chat_response = chat_response + top_token
-
-            formatted_prompt = "<|im_start|>system\n"
-            if system_prompt.strip():
-                formatted_prompt += system_prompt.strip()
-            else:
-                formatted_prompt += "You are a helpful assistant."
-            formatted_prompt += " /no_think<|im_end|>\n"
-            formatted_prompt += f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            formatted_prompt += f"<|im_start|>assistant\n<think>\n\n</think>\n\n{new_chat_response}"
-
-            output = current_analyzer.model.create_completion(
-                prompt=formatted_prompt, max_tokens=1, logprobs=20,
-                temperature=1.0, top_p=1.0, top_k=-1,
-                repeat_penalty=config.repeat_penalty, echo=False
-            )
-
-            token_probs = current_analyzer._extract_probabilities(output, config)
-
-            if not token_probs and "choices" in output and output["choices"]:
-                choice = output["choices"][0]
-                if choice.get("finish_reason") == "length":
-                    output2 = current_analyzer.model.create_completion(
-                        prompt=formatted_prompt + " ", max_tokens=1, logprobs=20,
-                        temperature=1.0, top_p=1.0, top_k=-1,
-                        repeat_penalty=config.repeat_penalty * 0.99, echo=False
-                    )
-                    token_probs = current_analyzer._extract_probabilities(output2, config)
-
-            return_generate_prompt = generate_prompt
-            return_chat_response = new_chat_response
-
+            new_chat_response = chat_response + chosen_token
+            prompt = build_chat_prompt(system_prompt, user_prompt, assistant_prefix=new_chat_response)
+            new_generate_prompt = generate_prompt
         else:
-            new_generate_prompt = generate_prompt + top_token
-            token_probs = current_analyzer.analyze_continuation(new_generate_prompt, config)
-            return_generate_prompt = new_generate_prompt
-            return_chat_response = chat_response
+            new_generate_prompt = generate_prompt + chosen_token
+            prompt = new_generate_prompt
+            new_chat_response = chat_response
 
+        token_probs = current_analyzer.analyze_prompt(prompt, config)
         last_analysis_results = token_probs
-
-        if not token_probs:
-            formatted_results = "**No more tokens available**\n\nTry clicking 'Add Top Token' again."
-            pie_chart = None
-            button_state = gr.Button(interactive=False)
-        else:
-            formatted_results = format_results(token_probs)
-            pie_chart = create_pie_chart(token_probs)
-            if is_stop_token(token_probs[0][0]):
-                button_state = gr.Button(interactive=False)
-                formatted_results += "\n\n🔒 'Add Top Token' disabled - top token is a stop token"
-            else:
-                button_state = gr.Button(interactive=True)
-
-        return formatted_results, pie_chart, button_state, return_generate_prompt, return_chat_response
-
+        body, chart, *btn_and_prompt = _analyze_response(token_probs, current_analyzer.last_prompt)
+        *btn_updates, prompt_view = btn_and_prompt
+        return (body, chart, *btn_updates, new_generate_prompt, new_chat_response, prompt_view)
     except Exception as e:
         import traceback
-        error_msg = f"Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-        return error_msg, None, gr.Button(interactive=False), generate_prompt, chat_response
+        return (f"Error: {e}\n\n```\n{traceback.format_exc()}```", None,
+                *_disabled_buttons(), generate_prompt, chat_response, "")
 
 
-def format_results(token_probs: List[Tuple[str, float, float]]) -> str:
-    result = f"**Top {len(token_probs)} next token probabilities:**\n"
-    result += "─" * 60 + "\n"
+def reset_state(mode):
+    """Clear chat response / generate prompt back to defaults and wipe analysis state."""
+    global last_analysis_results
+    last_analysis_results = None
+    if mode == "Chat":
+        return (gr.update(value=""), gr.update(value=DEFAULT_USER_PROMPT),
+                "Cleared. Click **Analyze** to start again.",
+                None, *_disabled_buttons(), "")
+    return (gr.update(value=""), gr.update(value=DEFAULT_GENERATE_PROMPT),
+            "Cleared. Click **Analyze** to start again.",
+            None, *_disabled_buttons(), "")
 
-    for idx, (token, prob, logit) in enumerate(token_probs):
-        token_repr = repr(token)
-        percentage = prob * 100
-        if is_stop_token(token):
-            result += f"{idx + 1:2d}. {token_repr:<20} {percentage:6.2f}% 🛑 STOP (logit: {logit:7.3f})\n"
-        else:
-            result += f"{idx + 1:2d}. {token_repr:<20} {percentage:6.2f}%          (logit: {logit:7.3f})\n"
 
-    total_prob = sum(prob for _, prob, _ in token_probs) * 100
-    result += f"\n**Total probability:** {total_prob:.2f}%"
-    return result
+def _format_pct(prob: float) -> str:
+    pct = prob * 100
+    return f"{pct:.4f}%" if pct >= 0.0001 else f"{pct:.2e}%"
+
+
+def format_top_tokens(token_probs: List[Tuple[str, float, float]],
+                      stop_probs: Optional[List[Tuple[str, int, float]]] = None) -> str:
+    lines = [f"**Top {len(token_probs)} candidate tokens**", ""]
+    lines.append("| # | Token | Probability | Logit |")
+    lines.append("|---:|---|---:|---:|")
+    for i, (token, prob, logit) in enumerate(token_probs, 1):
+        marker = "🛑 " if is_stop_token(token) else ""
+        lines.append(f"| {i} | {marker}`{repr(token)}` | {prob * 100:.2f}% | {logit:.3f} |")
+    # Combined stop-token row directly under the top-5, even when EOS is ranked
+    # far below — the canonical "why doesn't it stop?" readout.
+    if stop_probs:
+        cum = sum(p for _, _, p in stop_probs)
+        lines.append(f"| 🛑 | _stop tokens (combined)_ | {_format_pct(cum)} | — |")
+    total = sum(p for _, p, _ in token_probs) * 100
+    lines.append("")
+    lines.append(f"_Top {len(token_probs)} cover **{total:.2f}%** of the full distribution._")
+    return "\n".join(lines)
 
 
 def create_pie_chart(token_probs: List[Tuple[str, float, float]]):
     if not token_probs:
         return None
 
-    tokens = []
-    probabilities = []
-    colors = []
-
+    labels, values, colors, hover = [], [], [], []
+    palette = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899",
+               "#06b6d4", "#84cc16", "#f43f5e", "#a855f7", "#14b8a6"]
+    palette_idx = 0
     for token, prob, logit in token_probs:
-        token_display = repr(token).replace("'", "").replace('"', '')
-        if len(token_display) > 15:
-            token_display = token_display[:12] + "..."
-
-        percentage = prob * 100
+        display = repr(token)
+        if len(display) > 22:
+            display = display[:19] + "…"
+        pct = prob * 100
         if is_stop_token(token):
-            token_display = f"🛑 {token_display} ({percentage:.1f}%)"
-            colors.append('#ff4444')
+            labels.append(f"🛑 {display} ({pct:.2f}%)")
+            colors.append("#ef4444")
         else:
-            token_display = f"{token_display} ({percentage:.1f}%)"
-            colors.append(None)
+            labels.append(f"{display} ({pct:.2f}%)")
+            colors.append(palette[palette_idx % len(palette)])
+            palette_idx += 1
+        values.append(prob)
+        hover.append(f"token: {repr(token)}<br>probability: {pct:.3f}%<br>logit: {logit:.3f}")
 
-        tokens.append(token_display)
-        probabilities.append(prob)
+    # The displayed tokens rarely cover 100% of the vocab — represent the rest
+    # honestly with a grey "other" wedge so the pie shows the true distribution.
+    shown = sum(values)
+    if shown < 0.9995:
+        remaining = 1.0 - shown
+        labels.append(f"(other tokens — {remaining * 100:.2f}%)")
+        values.append(remaining)
+        colors.append("#e5e7eb")
+        hover.append(f"all other vocab tokens<br>cumulative: {remaining * 100:.3f}%")
 
     fig = go.Figure(data=[go.Pie(
-        labels=tokens, values=probabilities, textinfo='none',
-        marker=dict(colors=colors) if any(colors) else None
+        labels=labels, values=values, textinfo="none",
+        marker=dict(colors=colors),
+        hovertext=hover, hoverinfo="text",
+        sort=False, direction="clockwise",
     )])
-
     fig.update_layout(
-        title="Token Probability Distribution",
-        height=400, font=dict(size=12)
+        title="Next-token probability distribution",
+        height=310, font=dict(size=12),
+        margin=dict(l=10, r=10, t=50, b=10),
+        legend=dict(font=dict(size=11)),
     )
     return fig
 
@@ -401,106 +414,152 @@ def create_pie_chart(token_probs: List[Tuple[str, float, float]]):
 def create_gradio_interface():
     with gr.Blocks(title="Token Probability Analyzer") as app:
         with gr.Row():
-            with gr.Column():
+            with gr.Column(scale=3):
                 gr.Markdown("# 🔍 Token Probability Analyzer")
-                gr.Markdown("Analyze token probabilities from language models.")
-            with gr.Column(scale=0):
+                gr.Markdown(
+                    "Inspect what the model **would** sample next, token by token. "
+                    "Qwen3 thinking mode is forcibly **off** "
+                    "(`/no_think` directive + pre-seeded empty `<think></think>` block)."
+                )
+            with gr.Column(scale=2):
                 mode = gr.Radio(
                     choices=["Chat", "Generate"], value="Chat", label="Mode",
-                    info="Chat: separate response window | Generate: add to existing text"
+                    info="Chat: separate response window  •  Generate: continue raw text",
                 )
+                model_status = gr.Markdown("_No model loaded_")
 
         with gr.Tab("Token Analysis"):
             with gr.Row():
-                with gr.Column():
-                    system_prompt = gr.Textbox(label="System Prompt (Optional)", value="", lines=2,
-                                                placeholder="System instructions...", visible=True)
-                    user_prompt = gr.Textbox(label="User Prompt", value=DEFAULT_PROMPT, lines=2, visible=True)
-                    chat_response = gr.Textbox(label="Assistant Response", value="", lines=3,
-                                                placeholder="Response will appear here as you add tokens...", visible=True)
-                    generate_prompt = gr.Textbox(label="Text to Continue", value=DEFAULT_PROMPT, lines=6,
-                                                  placeholder="Text will grow here as you add tokens...", visible=False)
+                with gr.Column(scale=1):
+                    system_prompt = gr.Textbox(label="System Prompt (optional)", value=DEFAULT_SYSTEM_PROMPT, lines=2,
+                                               placeholder="System instructions…", visible=True)
+                    user_prompt = gr.Textbox(label="User Prompt", value=DEFAULT_USER_PROMPT, lines=2, visible=True)
+                    chat_response = gr.Textbox(label="Assistant Response", value="", lines=4,
+                                               placeholder="Response will grow here as you add tokens…", visible=True)
+                    generate_prompt = gr.Textbox(label="Text to Continue", value=DEFAULT_GENERATE_PROMPT, lines=6,
+                                                 placeholder="Text will grow here as you add tokens…", visible=False)
 
-                    with gr.Accordion("Parameters", open=True):
+                    with gr.Accordion("Sampling parameters (Qwen3 no-think defaults)", open=False):
                         with gr.Row():
-                            temperature = gr.Slider(0.01, 2.0, value=0.8, label="Temperature")
-                            num_tokens = gr.Slider(1, 20, value=10, step=1, label="Tokens to Show")
+                            temperature = gr.Slider(0.01, 2.0, value=QWEN3_NO_THINK_DEFAULTS["temperature"],
+                                                    label="Temperature")
+                            top_p = gr.Slider(0.01, 1.0, value=QWEN3_NO_THINK_DEFAULTS["top_p"], label="Top-p")
                         with gr.Row():
-                            top_p = gr.Slider(0.01, 1.0, value=0.95, label="Top-p")
-                            top_k = gr.Slider(1, 100, value=40, step=1, label="Top-k")
-                        repeat_penalty = gr.Slider(0.5, 2.0, value=1.1, label="Repeat Penalty")
+                            top_k = gr.Slider(1, 100, value=QWEN3_NO_THINK_DEFAULTS["top_k"], step=1, label="Top-k")
+                            repeat_penalty = gr.Slider(0.5, 2.0, value=QWEN3_NO_THINK_DEFAULTS["repeat_penalty"],
+                                                       step=0.01, label="Repeat Penalty",
+                                                       info="Qwen team recommends leaving this at 1.0.")
 
                     with gr.Row():
                         analyze_btn = gr.Button("🚀 Analyze", variant="primary")
-                        add_token_btn = gr.Button("🔄 Add Top Token", variant="secondary")
+                        reset_btn = gr.Button("🧹 Clear", variant="stop")
 
-                with gr.Column():
-                    results = gr.Markdown("Click 'Analyze' to see results...")
-                    pie_chart = gr.Plot()
+                    gr.Markdown("**Inject a candidate** (greedy = `#1`; pick any other to explore the path-not-taken):")
+                    with gr.Row():
+                        add_buttons = [
+                            gr.Button(value=f"#{i + 1}", interactive=False,
+                                      variant=("primary" if i == 0 else "secondary"))
+                            for i in range(NUM_TOKENS_DISPLAYED)
+                        ]
+
+                    formatted_prompt_view = gr.Textbox(
+                        label="Formatted prompt sent to model", lines=8, interactive=False,
+                    )
+
+                with gr.Column(scale=1):
+                    chart = gr.Plot(label="")
+                    results = gr.Markdown("Click **Analyze** to see results…")
 
         with gr.Tab("Model Configuration"):
             with gr.Row():
                 with gr.Column():
-                    model_path = gr.Textbox(label="Model Path",
-                                             value=os.environ.get('GGUF_MODEL_PATH', DEFAULT_MODEL_PATH),
-                                             placeholder="Path to .gguf file")
+                    model_path = gr.Textbox(
+                        label="Model Path",
+                        value=os.environ.get("GGUF_MODEL_PATH", DEFAULT_MODEL_PATH),
+                        placeholder="Path to .gguf file",
+                    )
                     with gr.Row():
-                        context_size = gr.Number(label="Context Size", value=2048)
-                        gpu_layers = gr.Number(label="GPU Layers", value=DEFAULT_GPU_LAYERS)
+                        context_size = gr.Number(label="Context Size", value=DEFAULT_CONTEXT_SIZE, precision=0)
+                        gpu_layers = gr.Number(label="GPU Layers", value=DEFAULT_GPU_LAYERS, precision=0)
                     load_btn = gr.Button("🔄 Load Model", variant="primary")
                 with gr.Column():
                     load_status = gr.Textbox(label="Status", lines=4, interactive=False)
 
-        def toggle_mode(mode):
-            if mode == "Chat":
-                return (gr.update(visible=True), gr.update(visible=True),
-                        gr.update(visible=True), gr.update(visible=False))
-            else:
-                return (gr.update(visible=False), gr.update(visible=False),
-                        gr.update(visible=False), gr.update(visible=True))
+        def toggle_mode(m, current_user, current_generate):
+            # Preserve whatever text the user has typed; only seed the mode's
+            # default prompt when the target field is empty (Gradio doesn't
+            # always re-render the initial `value` of a component that was
+            # created with visible=False).
+            user_val = current_user if (current_user and current_user.strip()) else DEFAULT_USER_PROMPT
+            gen_val = current_generate if (current_generate and current_generate.strip()) else DEFAULT_GENERATE_PROMPT
+            if m == "Chat":
+                return (gr.update(visible=True),
+                        gr.update(visible=True, value=user_val),
+                        gr.update(visible=True),
+                        gr.update(visible=False))
+            return (gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=True, value=gen_val))
 
-        mode.change(fn=toggle_mode, inputs=[mode],
-                    outputs=[system_prompt, user_prompt, chat_response, generate_prompt])
+        # queue=False + show_progress="hidden": this is a pure UI toggle, never
+        # touching the model, so it shouldn't sit in the queue or show a spinner.
+        mode.change(fn=toggle_mode, inputs=[mode, user_prompt, generate_prompt],
+                    outputs=[system_prompt, user_prompt, chat_response, generate_prompt],
+                    queue=False, show_progress="hidden")
 
-        load_btn.click(fn=load_model, inputs=[model_path, context_size, gpu_layers],
-                       outputs=[load_status])
+        def load_and_update(p, c, g):
+            msg = load_model(p, c, g)
+            return msg, msg
+        load_btn.click(fn=load_and_update, inputs=[model_path, context_size, gpu_layers],
+                       outputs=[load_status, model_status])
 
         analyze_btn.click(
             fn=analyze_tokens,
-            inputs=[mode, system_prompt, user_prompt, generate_prompt, temperature, top_p, top_k, repeat_penalty, num_tokens],
-            outputs=[results, pie_chart, add_token_btn]
+            inputs=[mode, system_prompt, user_prompt, generate_prompt,
+                    temperature, top_p, top_k, repeat_penalty],
+            outputs=[results, chart, *add_buttons, formatted_prompt_view],
         )
 
-        add_token_btn.click(
-            fn=add_top_token,
-            inputs=[mode, system_prompt, user_prompt, generate_prompt, chat_response, temperature, top_p, top_k, repeat_penalty, num_tokens],
-            outputs=[results, pie_chart, add_token_btn, generate_prompt, chat_response]
+        # One click handler per candidate button; rank is bound at definition time
+        # so each lambda captures its own value rather than the loop variable.
+        for i, btn in enumerate(add_buttons):
+            btn.click(
+                fn=lambda *args, rank=i + 1: add_token_by_rank(rank, *args),
+                inputs=[mode, system_prompt, user_prompt, generate_prompt, chat_response,
+                        temperature, top_p, top_k, repeat_penalty],
+                outputs=[results, chart, *add_buttons,
+                         generate_prompt, chat_response, formatted_prompt_view],
+            )
+
+        reset_btn.click(
+            fn=reset_state,
+            inputs=[mode],
+            outputs=[chat_response, generate_prompt, results, chart,
+                     *add_buttons, formatted_prompt_view],
         )
 
     return app
 
 
 def main():
-    print("Starting Token Probability Analyzer...")
-
-    model_path = os.environ.get('GGUF_MODEL_PATH', DEFAULT_MODEL_PATH)
-
+    print("Starting Token Probability Analyzer…")
+    model_path = os.environ.get("GGUF_MODEL_PATH", DEFAULT_MODEL_PATH)
     if model_path and Path(model_path).exists():
         try:
-            load_model(model_path, 2048, DEFAULT_GPU_LAYERS)
+            load_model(model_path, DEFAULT_CONTEXT_SIZE, DEFAULT_GPU_LAYERS)
             print(f"✅ Model loaded from: {model_path}")
         except Exception as e:
             print(f"⚠️ Failed to load model: {e}")
     else:
-        print("⚠️ No model loaded - configure in the Model Configuration tab")
+        print("⚠️ No model loaded — configure in the Model Configuration tab")
 
-    port = os.environ.get('GRADIO_SERVER_PORT')
-
+    port = os.environ.get("GRADIO_SERVER_PORT")
     app = create_gradio_interface()
+    launch_kwargs = dict(server_name="127.0.0.1", share=False, theme=gr.themes.Soft())
     if port:
-        app.launch(server_name="127.0.0.1", server_port=int(port), share=False)
-    else:
-        app.launch(server_name="127.0.0.1", share=False)
+        launch_kwargs["server_port"] = int(port)
+    app.launch(**launch_kwargs)
 
 
 if __name__ == "__main__":

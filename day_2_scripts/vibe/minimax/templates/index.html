@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GDPR Article Browser</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #1a365d;
+            --primary-light: #2c5282;
+            --accent: #3182ce;
+            --accent-light: #63b3ed;
+            --bg: #f7fafc;
+            --surface: #ffffff;
+            --text: #1a202c;
+            --text-muted: #4a5568;
+            --border: #e2e8f0;
+            --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+            color: white;
+            padding: 2rem 1rem;
+            box-shadow: var(--shadow);
+        }
+
+        .header-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .header-icon {
+            width: 48px;
+            height: 48px;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+        }
+
+        .header-text h1 {
+            font-size: 1.75rem;
+            font-weight: 700;
+            letter-spacing: -0.025em;
+        }
+
+        .header-text h1 span {
+            color: rgba(255,255,255,0.6);
+            font-weight: 400;
+            font-size: 0.9rem;
+            margin-left: 0.5rem;
+        }
+
+        .header-text p {
+            font-size: 0.9rem;
+            opacity: 0.85;
+            margin-top: 0.25rem;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem 1rem;
+        }
+
+        .search-box {
+            margin-bottom: 1.5rem;
+        }
+
+        .search-input {
+            width: 100%;
+            max-width: 400px;
+            padding: 0.875rem 1rem;
+            padding-left: 2.75rem;
+            font-size: 1rem;
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            background: var(--surface);
+            transition: all 0.2s ease;
+            font-family: inherit;
+        }
+
+        .search-input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(49, 130, 206, 0.15);
+        }
+
+        .search-wrapper {
+            position: relative;
+            display: inline-block;
+            width: 100%;
+            max-width: 400px;
+        }
+
+        .search-icon {
+            position: absolute;
+            left: 1rem;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-muted);
+            pointer-events: none;
+        }
+
+        .main-layout {
+            display: grid;
+            grid-template-columns: 380px 1fr;
+            gap: 1.5rem;
+            align-items: start;
+        }
+
+        @media (max-width: 768px) {
+            .main-layout {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .article-list {
+            background: var(--surface);
+            border-radius: 16px;
+            box-shadow: var(--shadow);
+            overflow: hidden;
+        }
+
+        .list-header {
+            padding: 1rem 1.25rem;
+            background: #f8fafc;
+            border-bottom: 1px solid var(--border);
+            font-weight: 600;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .article-item {
+            padding: 1.25rem;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .article-item:last-child {
+            border-bottom: none;
+        }
+
+        .article-item:hover {
+            background: #f8fafc;
+        }
+
+        .article-item.selected {
+            background: linear-gradient(135deg, rgba(49, 130, 206, 0.08) 0%, rgba(49, 130, 206, 0.04) 100%);
+            border-left: 4px solid var(--accent);
+        }
+
+        .article-title {
+            font-family: 'Source Serif 4', Georgia, serif;
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--primary);
+            margin-bottom: 0.5rem;
+        }
+
+        .article-summary {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            line-height: 1.5;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .article-detail {
+            background: var(--surface);
+            border-radius: 16px;
+            box-shadow: var(--shadow-lg);
+            padding: 2rem;
+            position: sticky;
+            top: 2rem;
+        }
+
+        .detail-placeholder {
+            text-align: center;
+            padding: 4rem 2rem;
+            color: var(--text-muted);
+        }
+
+        .detail-placeholder-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.4;
+        }
+
+        .detail-header {
+            margin-bottom: 1.5rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 2px solid var(--border);
+        }
+
+        .detail-title {
+            font-family: 'Source Serif 4', Georgia, serif;
+            font-size: 1.75rem;
+            font-weight: 600;
+            color: var(--primary);
+            margin-bottom: 0.5rem;
+        }
+
+        .detail-label {
+            display: inline-block;
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%);
+            color: white;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .detail-section {
+            margin-bottom: 1.5rem;
+        }
+
+        .detail-section-title {
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+        }
+
+        .detail-summary {
+            font-size: 1rem;
+            color: var(--text);
+            line-height: 1.7;
+            padding: 1rem;
+            background: #f8fafc;
+            border-radius: 8px;
+            border-left: 4px solid var(--accent);
+        }
+
+        .detail-full-text {
+            font-family: 'Source Serif 4', Georgia, serif;
+            font-size: 0.95rem;
+            line-height: 1.8;
+            color: var(--text);
+            white-space: pre-wrap;
+        }
+
+        .detail-full-text .paragraph {
+            margin-bottom: 1rem;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-muted);
+        }
+
+        .spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin: 0 auto 1rem;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .fade-in {
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="header-content">
+            <div class="header-icon">🇪🇺</div>
+            <div class="header-text">
+                <h1>GDPR Article Browser<span>MiniMaxM2.7</span></h1>
+                <p>General Data Protection Regulation - Articles 20-25</p>
+            </div>
+        </div>
+    </header>
+
+    <div class="container">
+        <div class="search-box">
+            <div class="search-wrapper">
+                <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <path d="m21 21-4.35-4.35"></path>
+                </svg>
+                <input type="text" class="search-input" id="searchInput" placeholder="Search articles...">
+            </div>
+        </div>
+
+        <div class="main-layout">
+            <div class="article-list">
+                <div class="list-header">Articles</div>
+                <div id="articleList"></div>
+            </div>
+            <div class="article-detail" id="articleDetail">
+                <div class="detail-placeholder">
+                    <div class="detail-placeholder-icon">📋</div>
+                    <p>Select an article to view its contents</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let articles = [];
+
+        async function loadArticles() {
+            try {
+                const response = await fetch('/api/articles');
+                articles = (await response.json()).GDPR;
+                renderArticleList(articles);
+            } catch (error) {
+                console.error('Error loading articles:', error);
+            }
+        }
+
+        function renderArticleList(articleList) {
+            const listEl = document.getElementById('articleList');
+            listEl.innerHTML = articleList.map(article => `
+                <div class="article-item" onclick="selectArticle('${article.article}')">
+                    <div class="article-title">${article.article}</div>
+                    <div class="article-summary">${article.summary}</div>
+                </div>
+            `).join('');
+        }
+
+        function selectArticle(articleName) {
+            // Update selected state
+            document.querySelectorAll('.article-item').forEach(item => {
+                item.classList.remove('selected');
+            });
+            event.currentTarget.classList.add('selected');
+
+            // Find and display article
+            const article = articles.find(a => a.article === articleName);
+            if (article) {
+                showArticleDetail(article);
+            }
+        }
+
+        function showArticleDetail(article) {
+            const detailEl = document.getElementById('articleDetail');
+            detailEl.innerHTML = `
+                <div class="detail-header fade-in">
+                    <div class="detail-label">Article</div>
+                    <div class="detail-title">${article.article}</div>
+                </div>
+                <div class="detail-section fade-in">
+                    <div class="detail-section-title">Summary</div>
+                    <div class="detail-summary">${article.summary}</div>
+                </div>
+                <div class="detail-section fade-in">
+                    <div class="detail-section-title">Full Text</div>
+                    <div class="detail-full-text">${article.full_article}</div>
+                </div>
+            `;
+        }
+
+        // Search functionality
+        document.getElementById('searchInput').addEventListener('input', (e) => {
+            const query = e.target.value.toLowerCase();
+            const filtered = articles.filter(article =>
+                article.article.toLowerCase().includes(query) ||
+                article.summary.toLowerCase().includes(query)
+            );
+            renderArticleList(filtered);
+        });
+
+        // Load articles on page load
+        loadArticles();
+    </script>
+</body>
+</html>

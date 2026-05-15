@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GDPR Article Browser</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <div class="brand-bar">CodeX</div>
+      <header class="hero">
+        <div>
+          <p class="eyebrow">European Privacy Reference</p>
+          <h1>GDPR Article Browser</h1>
+          <p class="hero-copy">
+            Browse article summaries first, then open the full legal text when you need the exact wording.
+          </p>
+        </div>
+        <div class="hero-panel">
+          <span class="hero-stat-label">Initial smoke test</span>
+          <strong id="article-count">0 articles</strong>
+          <span class="hero-stat-note">Configured for Articles 20-25, with the data model ready for all GDPR articles.</span>
+        </div>
+      </header>
+
+      <main class="app-grid">
+        <section class="sidebar">
+          <div class="sidebar-header">
+            <label for="search">Search summaries</label>
+            <input id="search" type="search" placeholder="Filter by article or summary" />
+          </div>
+          <div id="article-list" class="article-list"></div>
+        </section>
+
+        <section class="detail-panel">
+          <div class="detail-header">
+            <p class="detail-kicker" id="detail-article">Select an article</p>
+            <h2 id="detail-title">Choose a summary on the left.</h2>
+            <p class="detail-summary" id="detail-summary">
+              The full article text will appear here.
+            </p>
+          </div>
+
+          <article class="article-card">
+            <div class="article-meta">
+              <span>Source text</span>
+              <a id="detail-source" href="#" target="_blank" rel="noreferrer">Open original</a>
+            </div>
+            <pre id="detail-body" class="article-body"></pre>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <template id="article-item-template">
+      <button class="article-item" type="button">
+        <span class="article-label"></span>
+        <strong class="article-item-title"></strong>
+        <span class="article-item-summary"></span>
+      </button>
+    </template>
+
+    <script src="./app.js" defer></script>
+  </body>
+</html>

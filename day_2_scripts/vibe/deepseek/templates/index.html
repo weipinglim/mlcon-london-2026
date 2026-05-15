@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GDPR Article Browser</title>
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --surface: #ffffff;
+    --border: #e2e2e7;
+    --text: #1d1d1f;
+    --text-secondary: #6e6e73;
+    --accent: #0071e3;
+    --accent-hover: #0077ed;
+    --selected-bg: #e8f0fe;
+    --selected-border: #0071e3;
+    --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-hover: 0 4px 12px rgba(0,0,0,0.08), 0 2px 4px rgba(0,0,0,0.04);
+    --radius: 10px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+
+  header h1 {
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+
+  header .badge {
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--bg);
+    padding: 4px 10px;
+    border-radius: 100px;
+    font-weight: 500;
+  }
+
+  .layout {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* --- Sidebar --- */
+  .sidebar {
+    width: 420px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--border);
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .sidebar-header {
+    padding: 16px 20px 12px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .sidebar-header input {
+    width: 100%;
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .sidebar-header input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0,113,227,0.12);
+  }
+
+  .article-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+  }
+
+  .article-card {
+    padding: 14px 16px;
+    margin-bottom: 4px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: all 0.12s ease;
+    border: 1.5px solid transparent;
+  }
+
+  .article-card:hover {
+    background: #fafafa;
+    box-shadow: var(--shadow-hover);
+  }
+
+  .article-card.selected {
+    background: var(--selected-bg);
+    border-color: var(--selected-border);
+  }
+
+  .article-card .art-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 4px;
+  }
+
+  .article-card .art-summary {
+    font-size: 14px;
+    line-height: 1.45;
+    color: var(--text);
+  }
+
+  .empty-state {
+    padding: 32px 20px;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 14px;
+  }
+
+  /* --- Detail panel --- */
+  .detail {
+    flex: 1;
+    overflow-y: auto;
+    padding: 32px 40px;
+    background: var(--bg);
+  }
+
+  .detail-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-secondary);
+    font-size: 15px;
+    text-align: center;
+    line-height: 1.6;
+  }
+
+  .detail-article {
+    max-width: 720px;
+  }
+
+  .detail-article h2 {
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin-bottom: 8px;
+  }
+
+  .detail-article .summary-banner {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    margin-bottom: 24px;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    box-shadow: var(--shadow);
+  }
+
+  .detail-article .summary-banner strong {
+    color: var(--text);
+  }
+
+  .detail-article .full-text {
+    font-size: 14px;
+    line-height: 1.7;
+  }
+
+  .detail-article .full-text p {
+    margin-bottom: 12px;
+  }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    .layout { flex-direction: column; }
+    .sidebar { width: 100%; max-height: 45vh; border-right: none; border-bottom: 1px solid var(--border); }
+    .detail { padding: 20px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>DeepSeek V4 &mdash; GDPR Article Browser</h1>
+  <span class="badge" id="article-count">{{ articles|length }} articles</span>
+</header>
+
+<div class="layout">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <input type="text" id="search" placeholder="Search summaries..." autocomplete="off">
+    </div>
+    <div class="article-list" id="article-list">
+      {% if articles %}
+        {% for a in articles %}
+        <div class="article-card" data-article="{{ a.article }}" data-index="{{ loop.index0 }}">
+          <div class="art-label">{{ a.article }}</div>
+          <div class="art-summary">{{ a.summary }}</div>
+        </div>
+        {% endfor %}
+      {% else %}
+        <div class="empty-state">No articles loaded.<br>Run the scraper to populate gdpr_articles.json.</div>
+      {% endif %}
+    </div>
+  </aside>
+
+  <!-- Detail panel -->
+  <main class="detail" id="detail">
+    <div class="detail-placeholder" id="placeholder">
+      Select an article from the left panel<br>to view its full text
+    </div>
+    <div class="detail-article" id="article-view" style="display:none;">
+      <h2 id="article-title"></h2>
+      <div class="summary-banner">
+        <strong>Summary:</strong> <span id="article-summary"></span>
+      </div>
+      <div class="full-text" id="article-full"></div>
+    </div>
+  </main>
+</div>
+
+<script>
+// Store articles in JS for instant switching
+const articles = {{ articles | tojson }};
+
+const listEl = document.getElementById('article-list');
+const searchEl = document.getElementById('search');
+const placeholderEl = document.getElementById('placeholder');
+const articleViewEl = document.getElementById('article-view');
+const titleEl = document.getElementById('article-title');
+const summaryEl = document.getElementById('article-summary');
+const fullEl = document.getElementById('article-full');
+let selectedIndex = null;
+
+function renderCard(a, index) {
+  const div = document.createElement('div');
+  div.className = 'article-card';
+  div.dataset.article = a.article;
+  div.dataset.index = index;
+  div.innerHTML = `<div class="art-label">${a.article}</div><div class="art-summary">${a.summary}</div>`;
+  div.addEventListener('click', () => selectArticle(index));
+  return div;
+}
+
+function selectArticle(index) {
+  selectedIndex = index;
+  const a = articles[index];
+
+  // Highlight card
+  document.querySelectorAll('.article-card').forEach(c => c.classList.remove('selected'));
+  const card = listEl.querySelector(`[data-index="${index}"]`);
+  if (card) card.classList.add('selected');
+
+  // Show detail
+  placeholderEl.style.display = 'none';
+  articleViewEl.style.display = 'block';
+  titleEl.textContent = a.article + ' GDPR';
+  summaryEl.textContent = a.summary;
+  fullEl.innerHTML = a.full_article
+    .split(/\n\n+/)
+    .filter(p => p.trim())
+    .map(p => `<p>${p}</p>`)
+    .join('');
+}
+
+searchEl.addEventListener('input', () => {
+  const q = searchEl.value.toLowerCase();
+  listEl.innerHTML = '';
+  let firstVisible = null;
+  articles.forEach((a, i) => {
+    if (!q || a.summary.toLowerCase().includes(q) || a.article.toLowerCase().includes(q)) {
+      const card = renderCard(a, i);
+      listEl.appendChild(card);
+      if (!firstVisible) firstVisible = i;
+    }
+  });
+  if (q && firstVisible !== null) {
+    // Don't auto-select, just show filtered results
+  }
+});
+
+// Attach click handlers to server-rendered cards
+listEl.querySelectorAll('.article-card').forEach(card => {
+  card.addEventListener('click', () => selectArticle(parseInt(card.dataset.index)));
+});
+
+// Select first article by default
+{% if articles %}
+selectArticle(0);
+{% endif %}
+</script>
+</body>
+</html>

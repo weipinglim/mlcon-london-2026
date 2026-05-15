@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GDPR Article Browser</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --navy: #0d1b2a;
+    --dark: #1b2838;
+    --accent: #4a90d9;
+    --accent-light: #6ba8e8;
+    --text: #e0e6ed;
+    --muted: #8899aa;
+    --card-bg: #162231;
+    --card-hover: #1c2d40;
+    --border: #2a3f55;
+    --success: #3ddc84;
+  }
+
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--navy);
+    color: var(--text);
+    min-height: 100vh;
+    line-height: 1.6;
+  }
+
+  header {
+    background: linear-gradient(135deg, var(--navy) 0%, #162a46 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 2rem 2rem 1.5rem;
+    text-align: center;
+  }
+
+  header h1 {
+    font-size: 1.8rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin-bottom: 0.25rem;
+  }
+
+  header h1 span { color: var(--accent); }
+
+  header p {
+    color: var(--muted);
+    font-size: 0.95rem;
+  }
+
+  .container {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 1.5rem 1rem;
+  }
+
+  .search-bar {
+    margin-bottom: 1.5rem;
+    position: relative;
+  }
+
+  .search-bar input {
+    width: 100%;
+    padding: 0.75rem 1rem 0.75rem 2.75rem;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-size: 1rem;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .search-bar input:focus { border-color: var(--accent); }
+  .search-bar input::placeholder { color: var(--muted); }
+
+  .search-bar svg {
+    position: absolute;
+    left: 0.85rem;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--muted);
+    width: 18px;
+    height: 18px;
+  }
+
+  .article-count {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
+  }
+
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 0.75rem;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  .card:hover {
+    background: var(--card-hover);
+    border-color: var(--accent);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 20px rgba(74, 144, 217, 0.12);
+  }
+
+  .card-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .card-header .badge {
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.2rem 0.6rem;
+    border-radius: 6px;
+    white-space: nowrap;
+  }
+
+  .card-header .title {
+    font-size: 1.05rem;
+    font-weight: 500;
+    color: var(--text);
+  }
+
+  .card .summary {
+    color: var(--muted);
+    font-size: 0.92rem;
+    line-height: 1.55;
+  }
+
+  /* Detail modal */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(5, 12, 20, 0.85);
+    z-index: 100;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+    backdrop-filter: blur(4px);
+  }
+
+  .overlay.active { display: flex; }
+
+  .modal {
+    background: var(--dark);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    max-width: 720px;
+    width: 100%;
+    max-height: 85vh;
+    overflow-y: auto;
+    padding: 2rem;
+    position: relative;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  }
+
+  .modal::-webkit-scrollbar { width: 6px; }
+  .modal::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .modal .close-btn {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    font-size: 1.2rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+  }
+
+  .modal .close-btn:hover {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+
+  .modal .modal-badge {
+    display: inline-block;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.85rem;
+    font-weight: 600;
+    padding: 0.3rem 0.8rem;
+    border-radius: 8px;
+    margin-bottom: 0.75rem;
+  }
+
+  .modal h2 {
+    font-size: 1.4rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+    color: #fff;
+  }
+
+  .modal .section-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent-light);
+    margin-bottom: 0.4rem;
+  }
+
+  .modal .summary-text {
+    color: var(--muted);
+    font-size: 0.95rem;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .modal .full-text {
+    color: var(--text);
+    font-size: 0.95rem;
+    line-height: 1.7;
+    white-space: pre-line;
+  }
+
+  .loading {
+    text-align: center;
+    padding: 4rem 1rem;
+    color: var(--muted);
+  }
+
+  .loading .spinner {
+    width: 36px;
+    height: 36px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin: 0 auto 1rem;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  footer {
+    text-align: center;
+    padding: 2rem 1rem;
+    color: var(--muted);
+    font-size: 0.8rem;
+    border-top: 1px solid var(--border);
+    margin-top: 2rem;
+  }
+
+  footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>GLM-5.1</span></h1>
+  <p style="font-size:1.3rem;font-weight:600;margin-top:0.25rem;"><span>GDPR</span> Article Browser</p>
+  <p>Summaries generated by Qwen 3.5 4B via Ollama &middot; Source: gdpr-info.eu</p>
+</header>
+
+<div class="container">
+  <div class="search-bar">
+    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+      <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
+    </svg>
+    <input type="text" id="search" placeholder="Search articles by title, number, or content..." />
+  </div>
+  <div class="article-count" id="count"></div>
+  <div id="card-list">
+    <div class="loading">
+      <div class="spinner"></div>
+      Loading articles...
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <button class="close-btn" id="close-btn">&times;</button>
+    <div id="modal-content"></div>
+  </div>
+</div>
+
+<footer>
+  Data scraped from <a href="https://gdpr-info.eu/" target="_blank" rel="noopener">gdpr-info.eu</a>
+  &middot; Built for MLCon London 2026
+</footer>
+
+<script>
+let articles = [];
+
+async function loadArticles() {
+  try {
+    const resp = await fetch('/api/articles');
+    const data = await resp.json();
+    articles = Array.isArray(data) ? data : (data.GDPR || []);
+    renderCards(articles);
+  } catch (e) {
+    document.getElementById('card-list').innerHTML =
+      '<div class="loading"><p>Failed to load articles. Run scrape_gdpr.py first.</p></div>';
+  }
+}
+
+function renderCards(list) {
+  const container = document.getElementById('card-list');
+  const countEl = document.getElementById('count');
+  countEl.textContent = `${list.length} article${list.length !== 1 ? 's' : ''}`;
+
+  if (list.length === 0) {
+    container.innerHTML = '<div class="loading"><p>No matching articles found.</p></div>';
+    return;
+  }
+
+  container.innerHTML = list.map((a, i) => `
+    <div class="card" data-index="${i}">
+      <div class="card-header">
+        <span class="badge">${a.article}</span>
+        <span class="title">${a.title || ''}</span>
+      </div>
+      <div class="summary">${a.summary}</div>
+    </div>
+  `).join('');
+}
+
+function openModal(article) {
+  const overlay = document.getElementById('overlay');
+  const content = document.getElementById('modal-content');
+  content.innerHTML = `
+    <span class="modal-badge">${article.article}</span>
+    <h2>${article.title || article.article + ' GDPR'}</h2>
+    <div class="section-label">AI Summary</div>
+    <div class="summary-text">${article.summary}</div>
+    <div class="section-label">Full Text</div>
+    <div class="full-text">${article.full_article}</div>
+  `;
+  overlay.classList.add('active');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeModal() {
+  document.getElementById('overlay').classList.remove('active');
+  document.body.style.overflow = '';
+}
+
+// Events
+document.getElementById('card-list').addEventListener('click', e => {
+  const card = e.target.closest('.card');
+  if (!card) return;
+  const idx = parseInt(card.dataset.index);
+  const filtered = getFiltered();
+  openModal(filtered[idx]);
+});
+
+document.getElementById('close-btn').addEventListener('click', closeModal);
+document.getElementById('overlay').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+});
+
+function getFiltered() {
+  const q = document.getElementById('search').value.toLowerCase().trim();
+  if (!q) return articles;
+  return articles.filter(a =>
+    a.article.toLowerCase().includes(q) ||
+    (a.title || '').toLowerCase().includes(q) ||
+    a.summary.toLowerCase().includes(q) ||
+    a.full_article.toLowerCase().includes(q)
+  );
+}
+
+document.getElementById('search').addEventListener('input', () => {
+  renderCards(getFiltered());
+});
+
+loadArticles();
+</script>
+
+</body>
+</html>
